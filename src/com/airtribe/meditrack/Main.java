@@ -4,10 +4,16 @@ import com.airtribe.meditrack.constants.Constants;
 import com.airtribe.meditrack.entity.*;
 import com.airtribe.meditrack.exception.AppointmentNotFoundException;
 import com.airtribe.meditrack.exception.InvalidDataException;
+import com.airtribe.meditrack.exception.PaymentFailedException;
 import com.airtribe.meditrack.interfaces.ConsoleReminderObserver;
+import com.airtribe.meditrack.interfaces.PaymentStrategy;
+import com.airtribe.meditrack.payment.CardPayment;
+import com.airtribe.meditrack.payment.UpiPayment;
 import com.airtribe.meditrack.service.*;
+import com.airtribe.meditrack.util.DateUtil;
 
 import java.time.LocalDateTime;
+import java.time.format.DateTimeParseException;
 import java.util.List;
 import java.util.Scanner;
 
@@ -208,6 +214,8 @@ public class Main {
         String docId = scanner.nextLine();
         System.out.print("Patient ID: ");
         String patId = scanner.nextLine();
+        System.out.print("Date/time (yyyy-MM-dd HH:mm, e.g. " + DateUtil.format(LocalDateTime.now().plusDays(1)) + "): ");
+        String dateTimeInput = scanner.nextLine();
 
         if (doctorService.searchDoctor(docId) == null) {
             System.out.println("No such doctor.");
@@ -218,9 +226,26 @@ public class Main {
             System.out.println("No such patient.");
             return;
         }
-        Appointment appt = appointmentService.createAppointment(docId, patId, LocalDateTime.now().plusDays(1));
-        patient.addAppointment(appt);
-        System.out.println("Booked: " + appt.summary());
+
+        LocalDateTime dateTime;
+        try {
+            dateTime = DateUtil.parse(dateTimeInput.trim());
+        } catch (DateTimeParseException e) {
+            System.out.println("Could not book appointment: invalid date/time format.");
+            return;
+        }
+        if (!DateUtil.isFuture(dateTime)) {
+            System.out.println("Could not book appointment: date/time must be in the future.");
+            return;
+        }
+
+        try {
+            Appointment appt = appointmentService.createAppointment(docId, patId, dateTime);
+            patient.addAppointment(appt);
+            System.out.println("Booked: " + appt.summary());
+        } catch (InvalidDataException e) {
+            System.out.println("Could not book appointment: " + e.getMessage());
+        }
     }
 
     private static void cancelAppointment() {
@@ -274,12 +299,52 @@ public class Main {
     private static void generateBill() {
         System.out.print("Appointment ID: ");
         String appointmentId = scanner.nextLine();
+
+        PaymentStrategy paymentStrategy = choosePaymentStrategy();
+        if (paymentStrategy == null) {
+            System.out.println("No bill generated: a valid payment method is required.");
+            return;
+        }
+
         try {
-            Bill bill = appointmentService.generateBillForAppointment(appointmentId);
+            Bill bill = appointmentService.generateBillForAppointment(appointmentId, paymentStrategy);
             BillSummary summary = bill.finalizeBill();
+            System.out.println("Payment successful via " + paymentStrategy.getPaymentMethod() + ".");
             System.out.println(summary);
-        } catch (AppointmentNotFoundException | InvalidDataException e) {
+        } catch (AppointmentNotFoundException | InvalidDataException | PaymentFailedException e) {
             System.out.println("Could not generate bill: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Strategy pattern entry point: lets the user pick how they want to
+     * pay (card or UPI) and collects the details that strategy needs.
+     * Returns null on an invalid choice so the caller can bail out
+     * without ever touching the appointment/bill.
+     */
+    private static PaymentStrategy choosePaymentStrategy() {
+        System.out.print("Payment method - 1) Card  2) UPI: ");
+        String choice = scanner.nextLine().trim();
+        switch (choice) {
+            case "1": {
+                System.out.print("Card number (16 digits): ");
+                String cardNumber = scanner.nextLine();
+                System.out.print("Card holder name: ");
+                String holderName = scanner.nextLine();
+                System.out.print("Expiry (MM/YY): ");
+                String expiry = scanner.nextLine();
+                System.out.print("CVV: ");
+                String cvv = scanner.nextLine();
+                return new CardPayment(cardNumber, holderName, expiry, cvv);
+            }
+            case "2": {
+                System.out.print("UPI ID (e.g. name@bank): ");
+                String upiId = scanner.nextLine();
+                return new UpiPayment(upiId);
+            }
+            default:
+                System.out.println("Unknown payment method.");
+                return null;
         }
     }
 }

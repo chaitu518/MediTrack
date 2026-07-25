@@ -1,5 +1,6 @@
 package com.airtribe.meditrack.service;
 
+import com.airtribe.meditrack.constants.Constants;
 import com.airtribe.meditrack.entity.Appointment;
 import com.airtribe.meditrack.entity.AppointmentStatus;
 import com.airtribe.meditrack.entity.Bill;
@@ -7,9 +8,13 @@ import com.airtribe.meditrack.entity.Doctor;
 import com.airtribe.meditrack.entity.Patient;
 import com.airtribe.meditrack.exception.AppointmentNotFoundException;
 import com.airtribe.meditrack.exception.InvalidDataException;
+import com.airtribe.meditrack.exception.PaymentFailedException;
+import com.airtribe.meditrack.interfaces.PaymentStrategy;
 import com.airtribe.meditrack.util.DataStore;
+import com.airtribe.meditrack.util.DateUtil;
 import com.airtribe.meditrack.util.IdGenerator;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -49,12 +54,48 @@ public class AppointmentService {
         observers.add(observer);
     }
 
-    public Appointment createAppointment(String doctorId, String patientId, LocalDateTime dateTime) {
+    /**
+     * Creates an appointment, but only after checking it doesn't clash
+     * with an existing, non-cancelled appointment for the same doctor or
+     * the same patient within {@link Constants#APPOINTMENT_SLOT_MINUTES}
+     * of the requested time - i.e. real, structured scheduling rather
+     * than accepting any doctor/patient/time combination unchecked.
+     */
+    public Appointment createAppointment(String doctorId, String patientId, LocalDateTime dateTime)
+            throws InvalidDataException {
+        checkNoSchedulingConflict(doctorId, patientId, dateTime);
+
         String id = IdGenerator.getInstance().nextAppointmentId();
         Appointment appointment = new Appointment(id, doctorId, patientId, dateTime);
         store.save(appointment);
         notifyCreated(appointment);
         return appointment;
+    }
+
+    private void checkNoSchedulingConflict(String doctorId, String patientId, LocalDateTime dateTime)
+            throws InvalidDataException {
+        for (Appointment existing : store.findAll()) {
+            if (existing.getStatus() == AppointmentStatus.CANCELLED) {
+                continue;
+            }
+            if (!withinSlot(existing.getDateTime(), dateTime)) {
+                continue;
+            }
+            if (existing.getDoctorId().equals(doctorId)) {
+                throw new InvalidDataException("Doctor " + doctorId + " already has appointment " + existing.getId()
+                        + " at " + DateUtil.format(existing.getDateTime()) + ", within "
+                        + Constants.APPOINTMENT_SLOT_MINUTES + " minutes of the requested " + DateUtil.format(dateTime));
+            }
+            if (existing.getPatientId().equals(patientId)) {
+                throw new InvalidDataException("Patient " + patientId + " already has appointment " + existing.getId()
+                        + " at " + DateUtil.format(existing.getDateTime()) + ", within "
+                        + Constants.APPOINTMENT_SLOT_MINUTES + " minutes of the requested " + DateUtil.format(dateTime));
+            }
+        }
+    }
+
+    private boolean withinSlot(LocalDateTime a, LocalDateTime b) {
+        return Math.abs(Duration.between(a, b).toMinutes()) < Constants.APPOINTMENT_SLOT_MINUTES;
     }
 
     public Appointment viewAppointment(String id) throws AppointmentNotFoundException {
@@ -113,11 +154,15 @@ public class AppointmentService {
      * Generates a real, data-driven Bill for a given appointment: base
      * amount = that appointment's doctor's consultation fee; bill type =
      * derived from the patient's age/insurance, not chosen by the caller.
-     * A successful bill counts as payment, so a PENDING appointment is
-     * moved to CONFIRMED; a CANCELLED appointment can't be billed at all.
+     * The computed amount must be paid via the given {@link PaymentStrategy}
+     * (Strategy pattern - e.g. card or UPI) before anything is committed:
+     * if payment fails, no bill is returned and the appointment status is
+     * left untouched. Only a successful payment counts as confirmation, so
+     * a PENDING appointment is then moved to CONFIRMED; a CANCELLED
+     * appointment can't be billed at all.
      */
-    public Bill generateBillForAppointment(String appointmentId)
-            throws AppointmentNotFoundException, InvalidDataException {
+    public Bill generateBillForAppointment(String appointmentId, PaymentStrategy paymentStrategy)
+            throws AppointmentNotFoundException, InvalidDataException, PaymentFailedException {
 
         Appointment appointment = viewAppointment(appointmentId);
         if (appointment.getStatus() == AppointmentStatus.CANCELLED) {
@@ -138,6 +183,11 @@ public class AppointmentService {
 
         BillFactory.BillType type = resolveBillType(patient);
         Bill bill = billFactory.createBill(type, appointment, doctor);
+
+        // Bill is only committed once payment actually succeeds - a thrown
+        // PaymentFailedException here means the caller gets no bill and the
+        // appointment status stays exactly as it was.
+        paymentStrategy.pay(bill.getTotalAmount());
 
         if (appointment.getStatus() == AppointmentStatus.PENDING) {
             updateStatus(appointmentId, AppointmentStatus.CONFIRMED);

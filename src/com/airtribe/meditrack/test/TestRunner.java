@@ -4,6 +4,9 @@ import com.airtribe.meditrack.constants.Constants;
 import com.airtribe.meditrack.entity.*;
 import com.airtribe.meditrack.exception.AppointmentNotFoundException;
 import com.airtribe.meditrack.exception.InvalidDataException;
+import com.airtribe.meditrack.interfaces.PaymentStrategy;
+import com.airtribe.meditrack.payment.CardPayment;
+import com.airtribe.meditrack.payment.UpiPayment;
 import com.airtribe.meditrack.service.AppointmentService;
 import com.airtribe.meditrack.service.DoctorService;
 import com.airtribe.meditrack.service.PatientService;
@@ -28,6 +31,8 @@ public class TestRunner {
         run("Appointment lifecycle + auto-confirm on billing", TestRunner::testAppointmentLifecycleAndBilling);
         run("Billing blocks cancelled appointments", TestRunner::testBillingBlocksCancelledAppointment);
         run("Standard / senior-citizen / insurance billing strategies", TestRunner::testBillingStrategies);
+        run("Payment strategy blocks bad card/UPI payments", TestRunner::testPaymentStrategyBlocksBadPayment);
+        run("Appointment scheduling rejects double-bookings", TestRunner::testAppointmentSchedulingConflicts);
         run("Patient.clone() deep-clones appointment history", TestRunner::testPatientDeepClone);
         run("Appointment.clone() deep-clones notes", TestRunner::testAppointmentDeepClone);
         run("BillSummary is an immutable snapshot", TestRunner::testBillSummaryImmutability);
@@ -108,7 +113,7 @@ public class TestRunner {
         Appointment appt = as.createAppointment(doc.getId(), pat.getId(), LocalDateTime.now().plusDays(1));
         assertEquals(AppointmentStatus.PENDING, appt.getStatus(), "new appointments should start PENDING");
 
-        Bill bill = as.generateBillForAppointment(appt.getId());
+        Bill bill = as.generateBillForAppointment(appt.getId(), validCardPayment());
         double expectedTotal = 500 * (1 + Constants.TAX_RATE);
         assertEquals(expectedTotal, bill.getTotalAmount(), 0.001, "total should be base amount plus tax");
         assertEquals(AppointmentStatus.CONFIRMED, as.viewAppointment(appt.getId()).getStatus(),
@@ -139,7 +144,7 @@ public class TestRunner {
         as.cancelAppointment(appt.getId());
 
         assertThrows(InvalidDataException.class,
-                () -> as.generateBillForAppointment(appt.getId()),
+                () -> as.generateBillForAppointment(appt.getId(), validCardPayment()),
                 "a cancelled appointment should not be billable");
     }
 
@@ -149,21 +154,80 @@ public class TestRunner {
         AppointmentService as = new AppointmentService(ds, ps);
 
         Doctor doc = ds.addDoctor("Dr Strategy", 50, "9876543210", Specialization.ONCOLOGY, 1000);
+        LocalDateTime slot = LocalDateTime.now().plusDays(1);
 
         Patient standardPatient = ps.addPatient("Standard Pat", 40, "9876543211", "O+", false);
-        Appointment standardAppt = as.createAppointment(doc.getId(), standardPatient.getId(), LocalDateTime.now().plusDays(1));
-        Bill standardBill = as.generateBillForAppointment(standardAppt.getId());
+        Appointment standardAppt = as.createAppointment(doc.getId(), standardPatient.getId(), slot);
+        Bill standardBill = as.generateBillForAppointment(standardAppt.getId(), validCardPayment());
         assertEquals(1000.0, standardBill.getBaseAmount(), 0.001, "standard billing should charge the full consultation fee");
 
         Patient seniorPatient = ps.addPatient("Senior Pat", AppointmentService.SENIOR_CITIZEN_AGE_THRESHOLD, "9876543212", "A+", false);
-        Appointment seniorAppt = as.createAppointment(doc.getId(), seniorPatient.getId(), LocalDateTime.now().plusDays(1));
-        Bill seniorBill = as.generateBillForAppointment(seniorAppt.getId());
+        Appointment seniorAppt = as.createAppointment(doc.getId(), seniorPatient.getId(), slot.plusHours(1));
+        Bill seniorBill = as.generateBillForAppointment(seniorAppt.getId(), validUpiPayment());
         assertEquals(900.0, seniorBill.getBaseAmount(), 0.001, "senior citizens should get a 10% discount");
 
         Patient insuredPatient = ps.addPatient("Insured Pat", 35, "9876543213", "B+", true);
-        Appointment insuredAppt = as.createAppointment(doc.getId(), insuredPatient.getId(), LocalDateTime.now().plusDays(1));
-        Bill insuredBill = as.generateBillForAppointment(insuredAppt.getId());
+        Appointment insuredAppt = as.createAppointment(doc.getId(), insuredPatient.getId(), slot.plusHours(2));
+        Bill insuredBill = as.generateBillForAppointment(insuredAppt.getId(), validUpiPayment());
         assertEquals(300.0, insuredBill.getBaseAmount(), 0.001, "insurance should leave the patient only 30% of the fee");
+    }
+
+    private static void testAppointmentSchedulingConflicts() throws Exception {
+        DoctorService ds = new DoctorService();
+        PatientService ps = new PatientService();
+        AppointmentService as = new AppointmentService(ds, ps);
+
+        Doctor doc = ds.addDoctor("Dr Conflict", 45, "9876543210", Specialization.CARDIOLOGY, 500);
+        Patient patA = ps.addPatient("Pat Conflict A", 30, "9876543211", "O+", false);
+        Patient patB = ps.addPatient("Pat Conflict B", 32, "9876543212", "A+", false);
+
+        LocalDateTime slot = LocalDateTime.now().plusDays(1);
+        as.createAppointment(doc.getId(), patA.getId(), slot);
+
+        assertThrows(InvalidDataException.class,
+                () -> as.createAppointment(doc.getId(), patB.getId(), slot.plusMinutes(10)),
+                "same doctor within the slot window should be rejected as double-booked");
+
+        assertThrows(InvalidDataException.class,
+                () -> as.createAppointment(ds.addDoctor("Dr Other", 40, "9876543213", Specialization.DERMATOLOGY, 300).getId(),
+                        patA.getId(), slot.plusMinutes(10)),
+                "same patient within the slot window (different doctor) should also be rejected");
+
+        Appointment farEnough = as.createAppointment(doc.getId(), patB.getId(),
+                slot.plusMinutes(Constants.APPOINTMENT_SLOT_MINUTES));
+        assertTrue(farEnough != null, "a booking at/after the slot boundary should be allowed");
+    }
+
+    private static void testPaymentStrategyBlocksBadPayment() throws Exception {
+        DoctorService ds = new DoctorService();
+        PatientService ps = new PatientService();
+        AppointmentService as = new AppointmentService(ds, ps);
+
+        Doctor doc = ds.addDoctor("Dr Payment", 45, "9876543210", Specialization.CARDIOLOGY, 500);
+        Patient pat = ps.addPatient("Pat Payment", 30, "9876543211", "O+", false);
+        Appointment appt = as.createAppointment(doc.getId(), pat.getId(), LocalDateTime.now().plusDays(1));
+
+        PaymentStrategy invalidCard = new CardPayment("1234", "Pat Payment", "13/99", "12");
+        assertThrows(com.airtribe.meditrack.exception.PaymentFailedException.class,
+                () -> as.generateBillForAppointment(appt.getId(), invalidCard),
+                "an invalid card should fail payment");
+        assertEquals(AppointmentStatus.PENDING, as.viewAppointment(appt.getId()).getStatus(),
+                "a failed payment must not confirm the appointment or produce a bill");
+
+        PaymentStrategy invalidUpi = new UpiPayment("not-a-upi-id");
+        assertThrows(com.airtribe.meditrack.exception.PaymentFailedException.class,
+                () -> as.generateBillForAppointment(appt.getId(), invalidUpi),
+                "an invalid UPI id should fail payment");
+        assertEquals(AppointmentStatus.PENDING, as.viewAppointment(appt.getId()).getStatus(),
+                "a failed payment must not confirm the appointment or produce a bill");
+    }
+
+    private static PaymentStrategy validCardPayment() {
+        return new CardPayment("4111111111111111", "Test Patient", "12/30", "123");
+    }
+
+    private static PaymentStrategy validUpiPayment() {
+        return new UpiPayment("testpatient@upi");
     }
 
     private static void testPatientDeepClone() throws Exception {
